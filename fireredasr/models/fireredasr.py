@@ -43,7 +43,7 @@ class FireRedAsr:
     def transcribe(self, batch_uttid, batch_wav_path, args={}):
         feats, lengths, durs = self.feat_extractor(batch_wav_path)
         total_dur = sum(durs)
-        if args.get("use_gpu", False):
+        if args.get("use_gpu", True):
             feats, lengths = feats.cuda(), lengths.cuda()
             self.model.cuda()
         else:
@@ -79,7 +79,7 @@ class FireRedAsr:
                 LlmTokenizerWrapper.preprocess_texts(
                     origin_texts=[""]*feats.size(0), tokenizer=self.tokenizer,
                     max_len=128, decode=True)
-            if args.get("use_gpu", False):
+            if args.get("use_gpu", True):
                 input_ids = input_ids.cuda()
                 attention_mask = attention_mask.cuda()
             start_time = time.time()
