@@ -54,7 +54,19 @@ Results are reported in Character Error Rate (CER%) for Chinese and Word Error R
 
 ## Usage
 Download model files from [huggingface](https://huggingface.co/fireredteam) and place them in the folder `pretrained_models`.
-
+After downloading models, your `pretrained_models` folder should be like this:
+```doctest
+.
+├── FireRedASR-AED-L
+│   ├── cmvn.ark
+│   ├── cmvn.txt
+│   ├── config.yaml
+│   ├── dict.txt
+│   ├── model.pth.tar
+│   ├── README.md
+│   └── train_bpe1000.model
+└── README.md
+```
 
 ### Setup
 Create a Python environment and install dependencies
