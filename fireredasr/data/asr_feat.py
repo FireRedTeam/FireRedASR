@@ -17,7 +17,7 @@ class ASRFeatExtractor:
         feats = []
         durs = []
         for wav_path in wav_paths:
-            sample_rate, wav_np = kaldiio.load_mat(wav_path)
+            sample_rate, wav_np = self.load_audio(wav_path)
             dur = wav_np.shape[0] / sample_rate
             fbank = self.fbank((sample_rate, wav_np))
             if self.cmvn is not None:
@@ -38,7 +38,26 @@ class ASRFeatExtractor:
             pad[i, :xs[i].size(0)] = xs[i]
         return pad
 
+    
+    def load_audio(self,file):
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-threads", "0",
+            "-i", file,
+            "-f", "s16le",
+            "-ac", "1",
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-"
+        ]
+        # fmt: on
+        try:
+            out = run(cmd, capture_output=True, check=True).stdout
+        except CalledProcessError as e:
+            raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 
+        return 16000,np.frombuffer(out, np.int16)
 
 
 class CMVN:
