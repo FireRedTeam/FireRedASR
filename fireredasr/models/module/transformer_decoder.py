@@ -187,7 +187,7 @@ class DecoderLayer(nn.Module):
         self.mlp = PositionwiseFeedForward(d_model, d_model*4, dropout)
 
     def forward(self, dec_input, enc_output, self_attn_mask, cross_attn_mask,
-                cache=None, flash_attn_enabled=flash_attn_enabled):
+                cache=None, flash_attn_enabled=False):
         x = dec_input
         residual = x
         x = self.self_attn_norm(x)
