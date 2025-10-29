@@ -6,8 +6,6 @@ import torch.nn.functional as F
 from torch import Tensor
 import math
 import os
-import torch
-import torch.nn as nn
 
 try:
     import xformers.ops as xops
