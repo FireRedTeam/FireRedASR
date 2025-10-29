@@ -4,7 +4,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import math
+import os
+import torch
+import torch.nn as nn
 
+try:
+    import xformers.ops as xops
+    xformers_available = True
+except Exception as e:
+    xformers_available = False
+    print("xformers is not available because: %s", str(e))
+
+ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "SDPA") # Option: "NATIVE", "SDPA", "XFORMERS"
+print("ATTENTION_BACKEND: ", ATTENTION_BACKEND)
 
 class TransformerDecoder(nn.Module):
     def __init__(
@@ -222,8 +235,21 @@ class DecoderMultiHeadAttention(nn.Module):
         self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(d_model, n_head * self.d_k)
 
-        self.attention = DecoderScaledDotProductAttention(
-            temperature=self.d_k ** 0.5)
+        # Native multi-head attention
+        if ATTENTION_BACKEND.upper() == "NATIVE":
+            self.attention = DecoderScaledDotProductAttention(temperature=self.d_k ** 0.5)
+        # Torch SDPA
+        elif ATTENTION_BACKEND.upper() == "SDPA":
+            self.attention = DecoderTorchSDPA(temperature=self.d_k ** 0.5)
+        # XFormers attention
+        elif ATTENTION_BACKEND.upper() == "XFORMERS":
+            if not xformers_available:
+                print("ATTENTION_BACKEND='XFORMERS' selected, but the xformers package is not available. Please install xformers")
+                exit(1)
+            self.attention = DecoderXFormersAttention(self.n_head, self.d_k, self.d_model, temperature=self.d_k ** 0.5)
+        else:
+            print("Unsupported attention backend: ", ATTENTION_BACKEND)
+            exit(1)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -249,6 +275,7 @@ class DecoderMultiHeadAttention(nn.Module):
         return output
 
 
+# Native SDPA
 class DecoderScaledDotProductAttention(nn.Module):
     def __init__(self, temperature):
         super().__init__()
@@ -264,6 +291,45 @@ class DecoderScaledDotProductAttention(nn.Module):
         else:
             attn = torch.softmax(attn, dim=-1)
         output = torch.matmul(attn, v)
+
+        return output
+
+
+# Torch SDPA
+class DecoderTorchSDPA(nn.Module):
+    def __init__(self, temperature):
+        super().__init__()
+        self.temperature = temperature
+        self.scale = 1 / self.temperature
+
+    def forward(self, q, k, v, mask=None):
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            scale = self.scale
+        )
+
+        return output
+
+# xFormers Attention
+class DecoderXFormersAttention(nn.Module):
+    def __init__(self, n_head, d_k, d_model, temperature):
+        super().__init__()
+        self.temperature = temperature
+        self.n_head = n_head
+        self.d_k = d_k
+        self.d_model = d_model
+
+    def forward(self, q, k, v, mask=None):
+        bs = q.size(0)
+        dtype = q.dtype
+        q = q.reshape(bs * self.n_head, -1, self.d_k).half()
+        k = k.reshape(bs * self.n_head, -1, self.d_k).half()
+        v = v.reshape(bs * self.n_head, -1, self.d_k).half()
+
+        output = xops.memory_efficient_attention(q, k, v)
+        # reshape back to (bs, seq_len, d_model)
+        output = output.reshape(bs, self.n_head, -1, self.d_k).transpose(1, 2).contiguous().view(bs, -1, self.d_model).to(dtype)
+
         return output
 
 
