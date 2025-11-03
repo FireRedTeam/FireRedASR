@@ -377,7 +377,7 @@ class DecoderXFormersAttention(nn.Module):
                 scale=self.scale,
                 op=xops.fmha.ck.FwOp)
 
-        return output.view_as(original_query)
+        return output.view_as(original_query).to(original_query.dtype)
 
 
 class PositionwiseFeedForward(nn.Module):
