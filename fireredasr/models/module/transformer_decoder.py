@@ -301,12 +301,25 @@ class DecoderTorchSDPA(nn.Module):
         self.scale = 1 / self.temperature
 
     def forward(self, q, k, v, mask=None):
-        output = F.scaled_dot_product_attention(
+        bs = q.size(0)
+        output = None
+        if bs == 1:
+            output = F.scaled_dot_product_attention(
             q, k, v,
             scale = self.scale
         )
+        else:
+            if mask is not None:
+                if mask.dtype != torch.bool:
+                    mask = mask.eq(1)
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask = mask,
+                    scale = self.scale
+                )
 
         return output
+
 
 # xFormers Attention
 class DecoderXFormersAttention(nn.Module):
@@ -319,12 +332,53 @@ class DecoderXFormersAttention(nn.Module):
 
     def forward(self, q, k, v, mask=None):
         bs = q.size(0)
+        # Save lengths
+        q_len = q.size(2)  # seq_len_q
+        k_len = k.size(2)  # seq_len_k
         dtype = q.dtype
+
         q = q.reshape(bs * self.n_head, -1, self.d_k).half()
         k = k.reshape(bs * self.n_head, -1, self.d_k).half()
         v = v.reshape(bs * self.n_head, -1, self.d_k).half()
 
-        output = xops.memory_efficient_attention(q, k, v)
+        output = None
+        if bs == 1:
+            output = xops.memory_efficient_attention(q, k, v)
+        else:
+            attn_bias = None
+            # --- AUTO-DETECT causal self-attention ---
+            # q and k are the same tensor object in memory when this is pure self-attn
+            if q_len == k_len and q.data_ptr() == k.data_ptr():
+                attn_bias = xops.LowerTriangularMask()
+
+            # --- Cross-attention / padding mask ---
+            elif mask is not None:
+                mask = mask.to(torch.bool)
+
+                # If mask only has 1 in q_len dimension, expand it
+                if mask.size(2) == 1 and q_len > 1:
+                    mask = mask.expand(bs, 1, q_len, k_len)
+
+                # Expand mask for all heads
+                mask = mask.expand(bs, self.n_head, q_len, k_len) \
+                        .reshape(bs * self.n_head, q_len, k_len)
+
+                # Alignment requirement for xformers: pad allocation to multiple of 8
+                pad_k = ((k_len + 7) // 8) * 8
+                pad_q = ((q_len + 7) // 8) * 8
+
+                bias_full = torch.zeros(bs * self.n_head, pad_q, pad_k,
+                                        dtype=q.dtype, device=q.device)
+
+                bias_full[:, :q_len, :k_len].masked_fill_(~mask, float("-inf"))
+
+                # Slice down to actual shape but keep aligned backing storage
+                attn_bias = bias_full[:, :q_len, :k_len]
+
+            # --- Run memory-efficient attention ---
+            output = xops.memory_efficient_attention(q, k, v,
+                                                    attn_bias=attn_bias if attn_bias is not None else None)
+
         # reshape back to (bs, seq_len, d_model)
         output = output.reshape(bs, self.n_head, -1, self.d_k).transpose(1, 2).contiguous().view(bs, -1, self.d_model).to(dtype)
 

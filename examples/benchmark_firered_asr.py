@@ -48,6 +48,7 @@ def benchmark(model, wav_path, batch, warmpup=2, trials=10, enable_profile=False
     preprocess_dur = time.time() - preprocess_start
     print(f"preprocess_dur: {preprocess_dur:.3f} s")
     total_dur = sum(durs)
+    print(f"total input duration: {total_dur:.3f} s")
 
     # Warmup
     print("==========warmup========")
@@ -96,20 +97,27 @@ def benchmark(model, wav_path, batch, warmpup=2, trials=10, enable_profile=False
     for res in results:
         print(res)
     avg_rtf = sum(rtf_list) / len(rtf_list)
-    return rps, avg_rtf
+    return rps, avg_latency, avg_rtf
 
 if __name__ == "__main__":
-    audio_path = "examples/wav/TEST_MEETING_T0000000001_S00000.wav"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_path = "pretrained_models/FireRedASR-AED-L"
-    enable_profile = False
-    batch_sizes = [1]
+    parser = argparse.ArgumentParser(prog='Benchmark scripts for FireRedASR', usage='%(prog)s [options]')
+    parser.add_argument('-b', '--batch_sizes', type=int, nargs='+', default=1, help='List of batch sizes for performance evaluation')
+    parser.add_argument('-m', '--model_path', type=str, default="pretrained_models/FireRedASR-AED-L", help='Path to model directory')
+    parser.add_argument('-a', '--audio_path', type=str, default='examples/wav/TEST_MEETING_T0000000001_S00000.wav', help="Input audio path")
+    parser.add_argument('-d', '--device', type=str, default='cuda', help="Target inference device")
+    parser.add_argument('-p', '--profile', action='store_true', help='Enable torch profiler')
+    args = parser.parse_args()
+    audio_path = args.audio_path
+    model_path = args.model_path
+    device = args.device
+    enable_profile = args.profile
+    batch_sizes = args.batch_sizes # [1, 4, 8, 16, 32]
     model = load_model(model_path)
     
     if enable_profile:
-        rps, avg_rtf = benchmark(model, audio_path, batch=1, enable_profile=True)
+        rps, avg_rtf, avg_latency = benchmark(model, audio_path, batch=1, enable_profile=True)
     else:            
         for batch in batch_sizes:
             print(f"=============== batch size {batch} ==========================")
-            rps, avg_rtf = benchmark(model, audio_path, batch=batch)
-            print(f"batch size: {batch}, average latency: {1.0/rps:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
+            rps, avg_latency, avg_rtf = benchmark(model, audio_path, batch=batch)
+            print(f"batch size: {batch}, average latency: {avg_latency:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
