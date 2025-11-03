@@ -46,9 +46,9 @@ def benchmark(model, wav_path, batch, warmpup=2, trials=10, enable_profile=False
     feats = feats.half()
     feats, lengths = feats.cuda(), lengths.cuda()
     preprocess_dur = time.time() - preprocess_start
-    print(f"preprocess_dur: {preprocess_dur:.3f} s")
+    print(f"preprocess duration: {preprocess_dur:.3f} s")
     total_dur = sum(durs)
-    print(f"total input duration: {total_dur:.3f} s")
+    print(f"total input audio duration: {total_dur:.3f} s")
 
     # Warmup
     print("==========warmup========")
@@ -68,13 +68,12 @@ def benchmark(model, wav_path, batch, warmpup=2, trials=10, enable_profile=False
         start = time.time()
         with torch.no_grad():
             if enable_profile:
-                with torch_profiler(activities=[
-                    ProfilerActivity.CPU, 
-                    ProfilerActivity.CUDA], 
-                    record_shapes=True, 
-                    with_stack=True,
-                    profile_memory=False) as prof:
-                    #with record_function("model.model.transcribe"):
+                with torch_profiler(
+                        activities=[ProfilerActivity.CPU,
+                                    ProfilerActivity.CUDA],
+                        record_shapes=True,
+                        with_stack=True,
+                        profile_memory=False) as prof:
                     hyps = model.model.transcribe(feats, lengths)
                 print(prof.key_averages().table(sort_by="cuda_time_total"))
                 prof.export_chrome_trace(f"firered_asr_profile_{batch}_{ATTENTION_BACKEND}.json")
@@ -94,8 +93,10 @@ def benchmark(model, wav_path, batch, warmpup=2, trials=10, enable_profile=False
 
     avg_latency = total_time / trials
     rps = batch / avg_latency
-    for res in results:
-        print(res)
+    # Only print first result for debug purpose
+    print("results[0]: ", results[0])
+    #for res in results:
+        #print(res)
     avg_rtf = sum(rtf_list) / len(rtf_list)
     return rps, avg_latency, avg_rtf
 
@@ -111,13 +112,13 @@ if __name__ == "__main__":
     model_path = args.model_path
     device = args.device
     enable_profile = args.profile
-    batch_sizes = args.batch_sizes # [1, 4, 8, 16, 32]
+    batch_sizes = args.batch_sizes # [1, 4, 8, 16, 32, 64, 128, 256]
     model = load_model(model_path)
     
     if enable_profile:
         rps, avg_rtf, avg_latency = benchmark(model, audio_path, batch=1, enable_profile=True)
     else:            
         for batch in batch_sizes:
-            print(f"=============== batch size {batch} ==========================")
+            print(f"*************************** batch size {batch} ***************************")
             rps, avg_latency, avg_rtf = benchmark(model, audio_path, batch=batch)
             print(f"batch size: {batch}, average latency: {avg_latency:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
