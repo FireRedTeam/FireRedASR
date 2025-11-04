@@ -9,7 +9,7 @@ import os
 
 try:
     import xformers.ops as xops
-    from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+    from xformers.ops.fmha.attn_bias import BlockDiagonalMask, BlockDiagonalCausalMask
     xformers_available = True
 except Exception as e:
     xformers_available = False
@@ -358,11 +358,12 @@ class DecoderXFormersAttention(nn.Module):
             # --- Detect if it is causal self-attention ---
             # q and k are the same tensor object in memory when this is pure self-attn
             if q_len == k_len and q.data_ptr() == k.data_ptr():
-                attn_bias = xops.LowerTriangularMask()
+                attn_bias = BlockDiagonalCausalMask.from_seqlens([q_len] * bs, device=q.device)
 
             # --- Cross-attention / padding mask ---
             elif mask is not None:
-                attn_bias = BlockDiagonalMask.from_seqlens([q_len] * bs, [k_len] * bs, device=q.device)
+                encoder_seq_lens = [mask[i].flatten().sum() for i in range(mask.shape[0])]
+                attn_bias = BlockDiagonalMask.from_seqlens([q_len] * bs, encoder_seq_lens, device=q.device)
             # print("==========================================")
             # print("attn_bias: ", attn_bias)
             # print("query.shape: ", query.shape)
