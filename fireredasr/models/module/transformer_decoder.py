@@ -9,7 +9,6 @@ import os
 
 try:
     import xformers.ops as xops
-    from xformers.ops.fmha.attn_bias import BlockDiagonalMask, BlockDiagonalCausalMask
     xformers_available = True
 except Exception as e:
     xformers_available = False
@@ -224,7 +223,7 @@ class DecoderLayer(nn.Module):
 
 
 class DecoderMultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_head, dropout=0.1):
+    def __init__(self, d_model, n_head, dropout=0.1, attention_type=None):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
@@ -245,7 +244,7 @@ class DecoderMultiHeadAttention(nn.Module):
             if not xformers_available:
                 print("ATTENTION_BACKEND='XFORMERS' selected, but the xformers package is not available. Please install xformers")
                 exit(1)
-            self.attention = DecoderXFormersAttention(self.n_head, self.d_k, self.d_model, temperature=self.d_k ** 0.5)
+            self.attention = DecoderXFormersAttention(self.n_head, self.d_k, self.d_model, temperature=self.d_k ** 0.5, attention_type=attention_type)
         else:
             print("Unsupported attention backend: ", ATTENTION_BACKEND)
             exit(1)
@@ -258,6 +257,9 @@ class DecoderMultiHeadAttention(nn.Module):
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k)
         k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
         v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         if mask is not None:
             mask = mask.unsqueeze(1)
@@ -279,9 +281,6 @@ class DecoderScaledDotProductAttention(nn.Module):
         self.INF = float("inf")
 
     def forward(self, q, k, v, mask=None):
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
         attn = torch.matmul(q, k.transpose(2, 3)) / self.temperature
         if mask is not None:
             mask = mask.eq(0)
@@ -303,9 +302,6 @@ class DecoderTorchSDPA(nn.Module):
 
     def forward(self, q, k, v, mask=None):
         bs = q.size(0)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
         output = None
         if bs == 1:
             output = F.scaled_dot_product_attention(
@@ -325,60 +321,92 @@ class DecoderTorchSDPA(nn.Module):
         return output
 
 
+class XFormersAttentionMetadata:
+    """Metadata for XFormers Attention backend """
+    def __init__(self, attention_type):
+        self.attention_type = attention_type
+        self.attn_bias = None
+
+    def set_self_attn_bias(self):
+        if self.attention_type == "self_attention":
+            self.attn_bias = xops.LowerTriangularMask()
+        else:
+            print("Unknown attention type used, only support `self_attention`")
+
+    def set_cross_attn_bias(self, mask, bs, q_len, k_len):
+        if self.attention_type == "cross_attention":
+            mask = mask.to(torch.bool)
+
+            # If mask only has 1 in q_len dimension, expand it
+            if mask.size(2) == 1 and q_len > 1:
+                mask = mask.expand(bs, 1, q_len, k_len)
+
+            # Expand mask for all heads
+            mask = mask.expand(bs, self.n_head, q_len, k_len) \
+                    .reshape(bs * self.n_head, q_len, k_len)
+
+            # Alignment requirement for xformers: pad allocation to multiple of 8
+            pad_k = ((k_len + 7) // 8) * 8
+            pad_q = ((q_len + 7) // 8) * 8
+
+            bias_full = torch.zeros(bs * self.n_head, pad_q, pad_k,
+                                    dtype=q.dtype, device=q.device)
+
+            bias_full[:, :q_len, :k_len].masked_fill_(~mask, float("-inf"))
+
+            # Slice down to actual shape but keep aligned backing storage
+            self.attn_bias = bias_full[:, :q_len, :k_len]
+
+            print("Unknown attention type used, only support `self_attention` and `cross_attention`")
+
+    def get_attn_bias(self):
+        return self.attn_bias
+
 # xFormers Attention
 class DecoderXFormersAttention(nn.Module):
-    def __init__(self, n_head, d_k, d_model, temperature):
+    def __init__(self, n_head, d_k, d_model, temperature, attention_type):
         super().__init__()
         self.temperature = temperature
         self.n_head = n_head
         self.d_k = d_k
         self.d_model = d_model
-        self.scale = 1.0 / temperature
+        self.attention_metadata = XFormersAttentionMetadata(attention_type)
 
     def forward(self, q, k, v, mask=None):
         original_query = q
         bs = q.size(0)
-        q_len = q.size(1)  # seq_len_q
-        k_len = k.size(1)  # seq_len_k
+        # Save lengths
+        q_len = q.size(2)  # seq_len_q
+        k_len = k.size(2)  # seq_len_k
+        dtype = q.dtype
 
-        # Reshape and add batch dimension for input of xformers memory_efficient_attention_forward
-        q = q.reshape(-1, self.n_head, self.d_k).unsqueeze(0).half()
-        k = k.reshape(-1, self.n_head, self.d_k).unsqueeze(0).half()
-        v = v.reshape(-1, self.n_head, self.d_k).unsqueeze(0).half()
+        q = q.reshape(bs * self.n_head, -1, self.d_k).to(torch.bfloat16)
+        k = k.reshape(bs * self.n_head, -1, self.d_k).to(torch.bfloat16)
+        v = v.reshape(bs * self.n_head, -1, self.d_k).to(torch.bfloat16)
 
         output = None
         if bs == 1:
-            output = xops.memory_efficient_attention_forward(q,
-                                                             k,
-                                                             v,
-                                                             scale=self.scale,
-                                                             op=xops.fmha.ck.FwOp)
+            output = xops.memory_efficient_attention(q, k, v)
         else:
             attn_bias = None
-            # --- Detect if it is causal self-attention ---
+            # --- AUTO-DETECT causal self-attention ---
             # q and k are the same tensor object in memory when this is pure self-attn
-            if q_len == k_len and q.data_ptr() == k.data_ptr():
-                attn_bias = BlockDiagonalCausalMask.from_seqlens([q_len] * bs, device=q.device)
+            if self.attention_metadata.attention_type == "self_attention":
+                attn_bias = xops.LowerTriangularMask()
 
             # --- Cross-attention / padding mask ---
-            elif mask is not None:
-                encoder_seq_lens = [mask[i].flatten().sum() for i in range(mask.shape[0])]
-                attn_bias = BlockDiagonalMask.from_seqlens([q_len] * bs, encoder_seq_lens, device=q.device)
-            # print("==========================================")
-            # print("attn_bias: ", attn_bias)
-            # print("query.shape: ", query.shape)
-            # print("key.shape: ", key.shape)
-            # print("value.shape: ", value.shape)
-            # print("\n")
-            output = xops.memory_efficient_attention_forward(
-                q,
-                k,
-                v,
-                attn_bias=attn_bias,
-                scale=self.scale,
-                op=xops.fmha.ck.FwOp)
+            #elif mask is not None:
+            elif self.attention_metadata.attention_type == "cross_attention" and mask is not None:
+                if self.attention_metadata.get_attn_bias() == None:
+                    self.attention_metadata.set_cross_attn_bias(mask, bs, q_len, k_len)
+                attn_bias = self.attention_metadata.get_attn_bias()
 
-        return output.view_as(original_query).to(original_query.dtype)
+            # --- Run memory-efficient attention ---
+            output = xops.memory_efficient_attention(q, k, v,
+                                                    attn_bias=attn_bias if attn_bias is not None else None)
+
+        # reshape back to (bs, seq_len, d_model)
+        return output.view_as(original_query).to(dtype)
 
 
 class PositionwiseFeedForward(nn.Module):
