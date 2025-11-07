@@ -49,6 +49,10 @@ class TransformerDecoder(nn.Module):
     def batch_beam_search(self, encoder_outputs, src_masks,
                    beam_size=1, nbest=1, decode_max_len=0,
                    softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0):
+        if ATTENTION_BACKEND.upper() == "XFORMERS":
+            for dec_layer in self.layer_stack:
+                dec_layer.self_attn.attention.reset_attn_bias()
+                dec_layer.cross_attn.attention.reset_attn_bias()
         B = beam_size
         N, Ti, H = encoder_outputs.size()
         device = encoder_outputs.device
@@ -148,6 +152,7 @@ class TransformerDecoder(nn.Module):
                 }
                 n_nbest_hyps.append(new_hyp)
             nbest_hyps.append(n_nbest_hyps)
+
         return nbest_hyps
 
     def ignored_target_position_is_0(self, padded_targets, ignore_id):
@@ -362,6 +367,9 @@ class XFormersAttentionMetadata:
     def get_attn_bias(self):
         return self.attn_bias
 
+    def reset_attn_bias(self):
+        self.attn_bias = None
+
 # xFormers Attention
 class DecoderXFormersAttention(nn.Module):
     def __init__(self, n_head, d_k, d_model, temperature, attention_type):
@@ -371,6 +379,9 @@ class DecoderXFormersAttention(nn.Module):
         self.d_k = d_k
         self.d_model = d_model
         self.attention_metadata = XFormersAttentionMetadata(attention_type)
+
+    def reset_attn_bias(self):
+        self.attention_metadata.reset_attn_bias()
 
     def forward(self, q, k, v, mask=None):
         original_query = q

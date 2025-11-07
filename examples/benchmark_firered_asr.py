@@ -35,38 +35,11 @@ def load_audio(wav_path):
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
     return audio
 
-def benchmark(model, audio_dir, batch, warmpup=2, trials=10, enable_profile=False):
-    # Get list of .wav files (case-insensitive)
-    batch_wav_path = []
-
-    # Collect file paths and durations
-    file_durations = []
-    input_wav_path_list = [os.path.join(audio_dir, f)
-                        for f in os.listdir(audio_dir)
-                        if f.lower().endswith('.wav')]
-
-    for file_path in input_wav_path_list:
-        try:
-            y, sr = librosa.load(file_path, sr=None)  # keep original sampling rate
-            duration = len(y) / sr
-            file_durations.append((file_path, duration))
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
-
-    # Sort by duration (longest first)
-    file_durations.sort(key=lambda x: x[1], reverse=True)
-
-    # Take top N for batch
-    batch_wav_path = [fp for fp, dur in file_durations[:batch]]
-
-    # Optional: print results
-    for i, (fp, dur) in enumerate(file_durations[:batch], start=1):
-        print(f"{i}. {fp} - {dur:.2f} sec")
-
-    batch_uttid = list(range(batch))
+def run(model, batch_wav_path, warmpup=2, trials=10, enable_profile=False, offset=0):
+    batch_uttid = list(range(offset, offset + len(batch_wav_path), 1))
     results = None
     total_dur = None
- 
+
     preprocess_start = time.time()
     feats, lengths, durs = model.feat_extractor(batch_wav_path)
     feats = feats.to(torch.bfloat16)
@@ -74,8 +47,8 @@ def benchmark(model, audio_dir, batch, warmpup=2, trials=10, enable_profile=Fals
     preprocess_dur = time.time() - preprocess_start
     print(f"preprocess duration: {preprocess_dur:.3f} s")
     total_dur = sum(durs)
-    print(f"total input audio duration: {total_dur:.3f} s")
-
+    avg_audio_dur_per_sample = total_dur / len(durs)
+    print(f"total input audio duration: {total_dur:.3f} s, avg input audio duration per sample: {avg_audio_dur_per_sample:.3f} s")
     # Warmup
     print("==========warmup========")
     for _ in range(warmpup):
@@ -125,7 +98,56 @@ def benchmark(model, audio_dir, batch, warmpup=2, trials=10, enable_profile=Fals
     for res in results[-batch:]:
         print(res)
     avg_rtf = sum(rtf_list) / len(rtf_list)
-    return rps, avg_latency, avg_rtf
+    print(f"Finished benchmark test for batch size: {len(batch_wav_path)}, average latency: {avg_latency:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
+
+    return rps, avg_latency, avg_rtf, avg_audio_dur_per_sample, results[-batch:]
+
+def benchmark(model, audio_dir, batch, warmpup=2, trials=10, enable_profile=False):
+    # Get list of .wav files (case-insensitive)
+    batch_wav_path = []
+
+    # Collect file paths and durations
+    file_durations = []
+    input_wav_path_list = [os.path.join(audio_dir, f)
+                        for f in os.listdir(audio_dir)
+                        if f.lower().endswith('.wav')]
+
+    for file_path in input_wav_path_list:
+        try:
+            y, sr = librosa.load(file_path, sr=None)  # keep original sampling rate
+            duration = len(y) / sr
+            file_durations.append((file_path, duration))
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+
+    # Sort by duration (longest first)
+    file_durations.sort(key=lambda x: x[1], reverse=True)
+    # Optional: print all audio file with duration
+    for i, (fp, dur) in enumerate(file_durations, start=1):
+        print(f"{i}. {fp} - {dur:.2f} sec")
+
+    dataset_size = len(input_wav_path_list)
+    # Loop through data in batches
+    benchmark_results = []
+    e2e_start = time.time()
+    for start in range(0, dataset_size - dataset_size % batch, batch):
+        #batch_wav_path, dur = file_durations[start:start+batch]
+        batch_wav_path = [path for path, _ in file_durations[start:start + batch]]
+        print(f"Processing {batch} batched data from index {start} to {start + batch-1}")
+        rps, avg_latency, avg_rtf, avg_audio_dur_per_sample, model_results = run(model, batch_wav_path, warmpup, trials, enable_profile, offset=start)
+        benchmark_results.append((batch, avg_audio_dur_per_sample, avg_latency, rps, avg_rtf, model_results))
+
+    # Process remaining data if any
+    remainder = dataset_size % batch
+    if remainder:
+        #last_batch_wav_path = file_durations[-remainder:]
+        last_batch_wav_path = [path for path, _ in file_durations[-remainder:]]
+        print(f"Processing {remainder} remaining data : {last_batch_wav_path}")
+        rps, avg_latency, avg_rtf, avg_audio_dur_per_sample, model_results = run(model, last_batch_wav_path, warmpup, trials, enable_profile, offset=start)
+        benchmark_results.append((batch, avg_audio_dur_per_sample, avg_latency, rps, avg_rtf, model_results))
+    e2e_duration = time.time() - e2e_start
+
+    return benchmark_results, e2e_duration
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog='Benchmark scripts for FireRedASR', usage='%(prog)s [options]')
@@ -143,9 +165,17 @@ if __name__ == "__main__":
     model = load_model(model_path)
     
     if enable_profile:
-        rps, avg_rtf, avg_latency = benchmark(model, audio_dir, batch=1, enable_profile=True)
+        #rps, avg_rtf, avg_latency = benchmark(model, audio_dir, batch=1, enable_profile=True)
+        benchmark_results, e2e_duration = benchmark(model, audio_dir, batch=1, enable_profile=enable_profile)
     else:            
         for batch in batch_sizes:
             print(f"*************************** batch size {batch} ***************************")
-            rps, avg_latency, avg_rtf = benchmark(model, audio_dir, batch=batch)
-            print(f"batch size: {batch}, average latency: {avg_latency:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
+            #rps, avg_latency, avg_rtf = benchmark(model, audio_dir, batch=batch)
+            benchmark_results, e2e_duration = benchmark(model, audio_dir, batch=batch, enable_profile=enable_profile)
+
+            #print(f"batch size: {batch}, average latency: {avg_latency:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
+            print(f"\nbatch size: {batch}, e2e latency: {e2e_duration} s")
+            for res in benchmark_results:
+                print(res[5])
+            for res in benchmark_results:
+                print(f"batch size: {res[0]}, avg audio duration per sample: {res[1]:.3f} s, avg inference latency {res[2]:.3f} s | RPS: {res[3]:.2f}, avg RTF: {res[4]:.3f}")
