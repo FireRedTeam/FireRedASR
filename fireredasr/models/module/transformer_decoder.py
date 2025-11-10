@@ -1,4 +1,5 @@
 from typing import List, Optional, Dict
+import inspect
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,7 @@ import xformers.ops as xops
 
 from flash_attn import flash_attn_func, flash_attn_varlen_func
 
+import einops
 
 ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "SDPA") # Option: "NATIVE", "SDPA", "XFORMERS"
 MultiHeadAttention = None
@@ -160,6 +162,7 @@ class TransformerDecoder(nn.Module):
             is_finished = t_ys.eq(self.eos_id)
             is_finished_n = is_finished.sum().item()
             active_mask = ~is_finished.squeeze()  
+            #active_indices = self.filter_indexes[M][active_mask]
             active_indices = torch.nonzero_static(active_mask, size=M - int(is_finished_n)).squeeze(1)
 
             if is_finished_n == M:
@@ -385,9 +388,13 @@ class DecoderMHAXFormers(nn.Module):
         k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k).transpose(1, 2).reshape(bs * self.n_head, -1, self.d_k)
         v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k).transpose(1, 2).reshape(bs * self.n_head, -1, self.d_k)
         # single-step reshape+transpose
+        #q = einops.rearrange(self.w_qs(q), 'b s (h d) -> (b h) s d', h=self.n_head)
+        #k = einops.rearrange(self.w_ks(k), 'b s (h d) -> (b h) s d', h=self.n_head)
+        #v = einops.rearrange(self.w_vs(v), 'b s (h d) -> (b h) s d', h=self.n_head)
         output = xops.memory_efficient_attention(q, k, v)
         # back to (bs, seq_len, d_model)
         output = output.reshape(bs, self.n_head, -1, self.d_k).transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+        #output = einops.rearrange(output, '(b h) s d -> b s (h d)', b=bs, h=self.n_head)
         output = self.fc(output)
         return output
     
@@ -404,16 +411,16 @@ class DecoderMHAFlashAttn(nn.Module):
         self.w_vs = nn.Linear(d_model, n_head * self.d_k)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
 
-    #not support mask yet, only work well for batch=1
     def forward(self, q, k, v, mask=None, is_cross=False):
         is_casual = not is_cross
         bs = q.size(0)
         
-        if not is_casual:
+        if is_casual:
             q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k)
             k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
             v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)
-            output = flash_attn_func(q, k, v)
+            output = flash_attn_func(q, k, v, causal=is_casual)
+            output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         else:
             q = self.w_qs(q).view(-1, self.n_head, self.d_k)
             k = self.w_ks(k).view(-1, self.n_head, self.d_k)
@@ -421,23 +428,27 @@ class DecoderMHAFlashAttn(nn.Module):
             mask = mask.squeeze(1)
             bool_mask = mask.view(-1).bool()
             
-            if q.shape[0] == len(bool_mask):
-                var_q = q[bool_mask]
-            else:
-                var_q = q
             var_k = k[bool_mask]
             var_v = v[bool_mask]
             
             seq_lens = mask.sum(dim=1, dtype=torch.int32)
-            end_pos=torch.cumsum(seq_lens, dim=0)
-            start_pos=torch.tensor([0], device=seq_lens.device)
+            start_pos=torch.cumsum(seq_lens, dim=0) - seq_lens
+            end_pos=torch.tensor([torch.sum(seq_lens)], device=seq_lens.device)
             pos=torch.cat([start_pos, end_pos]).to(torch.int32)
-            cu_seqlens_q = pos
-            cu_seqlens_k = cu_seqlens_q
-            max_seqlen_q = max(seq_lens)
-            max_seqlen_k = max_seqlen_q
-            output = flash_attn_varlen_func(var_q, var_k, var_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=is_casual)
-        output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+            cu_seqlens_q = torch.arange(0, bs + 1, 1, device=seq_lens.device, dtype=torch.int32)
+            cu_seqlens_k = pos
+            max_seqlen_q = 1
+            max_seqlen_k = max(seq_lens)
+            
+            output = flash_attn_varlen_func(q=q, 
+                                            k=var_k, 
+                                            v=var_v, 
+                                            cu_seqlens_q=cu_seqlens_q, 
+                                            cu_seqlens_k=cu_seqlens_k, 
+                                            max_seqlen_q=max_seqlen_q, 
+                                            max_seqlen_k=max_seqlen_k, 
+                                            causal=is_casual)
+            output = output.contiguous().view(bs, -1, self.d_model)
         output = self.fc(output)
         return output
 
