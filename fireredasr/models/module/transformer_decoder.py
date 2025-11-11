@@ -52,6 +52,11 @@ class TransformerDecoder(nn.Module):
         self.filter_indexes = {}
         self.active_masks = {}
         
+        
+    def clear(self):
+        for dec_layer in self.layer_stack:
+            dec_layer.clear()        
+        
 
     def batch_beam_search(self, encoder_outputs, src_masks,
                    beam_size=1, nbest=1, decode_max_len=0,
@@ -112,7 +117,8 @@ class TransformerDecoder(nn.Module):
                     t_encoder_outputs,
                     tgt_mask, 
                     t_src_mask,
-                    cache=caches[i][active_indices])
+                    cache=caches[i][active_indices],
+                    active_indices=active_indices)
                 caches[i] = dec_output          
 
             dec_output = self.layer_norm_out(dec_output)
@@ -240,9 +246,12 @@ class DecoderLayer(nn.Module):
 
         self.mlp_norm = nn.LayerNorm(d_model)
         self.mlp = PositionwiseFeedForward(d_model, d_model*4, dropout)
+        
+    def clear(self):
+        self.cross_attn.clear()
 
     def forward(self, dec_input, enc_output, self_attn_mask, cross_attn_mask,
-                cache=None):
+                cache=None, active_indices=None):
         x = dec_input
         residual = x
         x = self.self_attn_norm(x)
@@ -254,7 +263,12 @@ class DecoderLayer(nn.Module):
             xq = x
         x = residual + self.self_attn(xq, x, x, mask=self_attn_mask)
         residual = x
-        x = residual+self.cross_attn(self.cross_attn_norm(x), enc_output, enc_output, mask=cross_attn_mask, is_cross=True)
+        x = residual+self.cross_attn(self.cross_attn_norm(x), 
+                                     enc_output, 
+                                     enc_output, 
+                                     mask=cross_attn_mask, 
+                                     is_cross=True,
+                                     active_indices=active_indices)
 
         residual = x
         x = self.mlp_norm(x)
@@ -262,9 +276,8 @@ class DecoderLayer(nn.Module):
 
         x = torch.cat([cache, x], dim=1)
         return x
-
-# Native MHA
-class DecoderMultiHeadAttention(nn.Module):
+    
+class BaseMultiHeadAttention(nn.Module):
     def __init__(self, d_model, n_head, dropout=0.1):
         super().__init__()
         self.d_model = d_model
@@ -274,10 +287,21 @@ class DecoderMultiHeadAttention(nn.Module):
         self.w_qs = nn.Linear(d_model, n_head * self.d_k)
         self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(d_model, n_head * self.d_k)
-        self.attention = DecoderScaledDotProductAttention(temperature=self.d_k ** 0.5)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
 
-    def forward(self, q, k, v, mask=None, is_cross=False):
+    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
+        raise NotImplementedError
+    
+    def clear(self):
+        pass
+
+# Native MHA
+class DecoderMultiHeadAttention(BaseMultiHeadAttention):
+    def __init__(self, d_model, n_head, dropout=0.1):
+        super().__init__(d_model, n_head, dropout)
+        self.attention = DecoderScaledDotProductAttention(temperature=self.d_k ** 0.5)
+
+    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
         bs = q.size(0)
 
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k)
@@ -315,20 +339,12 @@ class DecoderScaledDotProductAttention(nn.Module):
         return output
 
 # MHA with Torch SDPA
-class DecoderMHATorchSDPA(nn.Module):
+class DecoderMHATorchSDPA(BaseMultiHeadAttention):
     def __init__(self, d_model, n_head, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_k = d_model // n_head
-
-        self.w_qs = nn.Linear(d_model, n_head * self.d_k)
-        self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
-        self.w_vs = nn.Linear(d_model, n_head * self.d_k)
+        super().__init__(d_model, n_head, dropout)
         self.attention = DecoderTorchSDPA(temperature=self.d_k ** 0.5)
-        self.fc = nn.Linear(n_head * self.d_k, d_model)
 
-    def forward(self, q, k, v, mask=None, is_cross=False):
+    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
         bs = q.size(0)
 
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
@@ -366,21 +382,11 @@ class DecoderTorchSDPA(nn.Module):
         return output
 
 # MHA with xFormers
-class DecoderMHAXFormers(nn.Module):
+class DecoderMHAXFormers(BaseMultiHeadAttention):
     def __init__(self, d_model, n_head, dropout=0.1):
-        super().__init__()
-        assert d_model % n_head == 0
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_k = d_model // n_head
+        super().__init__(d_model, n_head, dropout)
 
-        self.w_qs = nn.Linear(d_model, n_head * self.d_k)
-        self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
-        self.w_vs = nn.Linear(d_model, n_head * self.d_k)
-
-        self.fc = nn.Linear(n_head * self.d_k, d_model)
-
-    def forward(self, q, k, v, mask=None, is_cross=False):
+    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
         bs = q.size(0)
 
         # projection and transform to (batch*n_head, seq_len, head_dim)
@@ -399,19 +405,20 @@ class DecoderMHAXFormers(nn.Module):
         return output
     
     
-class DecoderMHAFlashAttn(nn.Module):
+class DecoderMHAFlashAttn(BaseMultiHeadAttention):
     def __init__(self, d_model, n_head, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_k = d_model // n_head
+        super().__init__(d_model, n_head, dropout)
+        
+        self.cross_cache_k = None
+        self.cross_cache_v = None
+        self.cross_cache_seqs = None
+        
+    def clear(self):
+        self.cross_cache_k = None
+        self.cross_cache_v = None
+        self.cross_cache_seqs = None
 
-        self.w_qs = nn.Linear(d_model, n_head * self.d_k)
-        self.w_ks = nn.Linear(d_model, n_head * self.d_k, bias=False)
-        self.w_vs = nn.Linear(d_model, n_head * self.d_k)
-        self.fc = nn.Linear(n_head * self.d_k, d_model)
-
-    def forward(self, q, k, v, mask=None, is_cross=False):
+    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
         is_casual = not is_cross
         bs = q.size(0)
         
@@ -422,31 +429,34 @@ class DecoderMHAFlashAttn(nn.Module):
             output = flash_attn_func(q, k, v, causal=is_casual)
             output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         else:
-            q = self.w_qs(q).view(-1, self.n_head, self.d_k)
-            k = self.w_ks(k).view(-1, self.n_head, self.d_k)
-            v = self.w_vs(v).view(-1, self.n_head, self.d_k)
             mask = mask.squeeze(1)
             bool_mask = mask.view(-1).bool()
+            q = self.w_qs(q).view(-1, self.n_head, self.d_k)
             
-            var_k = k[bool_mask]
-            var_v = v[bool_mask]
-            
-            seq_lens = mask.sum(dim=1, dtype=torch.int32)
-            start_pos=torch.cumsum(seq_lens, dim=0) - seq_lens
-            end_pos=torch.tensor([torch.sum(seq_lens)], device=seq_lens.device)
-            pos=torch.cat([start_pos, end_pos]).to(torch.int32)
+            if self.cross_cache_k is None or self.cross_cache_v is None:
+                k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
+                v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)  
+                
+                seq_lens = mask.sum(dim=1, dtype=torch.int32)
+                self.cross_cache_k = k
+                self.cross_cache_v = v
+                self.cross_cache_seqs = seq_lens
+      
+            seq_lens = self.cross_cache_seqs[active_indices]
+            total, _max_seq_k = seq_lens.sum().item(), seq_lens.max().item()
+            bool_indices = torch.nonzero_static(bool_mask, size=total).squeeze(1)
+            var_k = self.cross_cache_k[active_indices].view(-1, self.n_head, self.d_k)[bool_indices]
+            var_v = self.cross_cache_v[active_indices].view(-1, self.n_head, self.d_k)[bool_indices]
             cu_seqlens_q = torch.arange(0, bs + 1, 1, device=seq_lens.device, dtype=torch.int32)
-            cu_seqlens_k = pos
-            max_seqlen_q = 1
-            max_seqlen_k = max(seq_lens)
-            
+            cu_seqlens_k = torch.zeros(bs + 1, device=seq_lens.device, dtype=torch.int32)
+            cu_seqlens_k[1:] = torch.cumsum(seq_lens, dim=0)
             output = flash_attn_varlen_func(q=q, 
                                             k=var_k, 
                                             v=var_v, 
                                             cu_seqlens_q=cu_seqlens_q, 
                                             cu_seqlens_k=cu_seqlens_k, 
-                                            max_seqlen_q=max_seqlen_q, 
-                                            max_seqlen_k=max_seqlen_k, 
+                                            max_seqlen_q=1, 
+                                            max_seqlen_k=_max_seq_k, 
                                             causal=is_casual)
             output = output.contiguous().view(bs, -1, self.d_model)
         output = self.fc(output)
