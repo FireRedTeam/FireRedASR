@@ -97,7 +97,11 @@ class TransformerDecoder(nn.Module):
 
         # Autoregressive Prediction
         for t in range(maxlen):
-            tgt_mask = self.ignored_target_position_is_0(ys, self.pad_id)
+            if ATTENTION_BACKEND == "FLASH_ATTN":
+                tgt_mask = ys
+            else:
+                tgt_mask = self.ignored_target_position_is_0(ys, self.pad_id)
+                
             dec_output = self.tgt_word_emb(ys) * self.scale + self.positional_encoding(ys)
             
             def expand(f, mask, indices, value=0.0, t=None):
@@ -258,7 +262,7 @@ class DecoderLayer(nn.Module):
         if cache.shape[1]:
             xq = x[:, -1:, :]
             residual = residual[:, -1:, :]
-            self_attn_mask = self_attn_mask[:, -1:, :]
+            self_attn_mask = self.self_attn.parse_mask(self_attn_mask)
         else:
             xq = x
         x = residual + self.self_attn(xq, x, x, mask=self_attn_mask)
@@ -294,6 +298,9 @@ class BaseMultiHeadAttention(nn.Module):
     
     def clear(self):
         pass
+    
+    def parse_mask(self, mask):
+        return mask[:, -1:, :]
 
 # Native MHA
 class DecoderMultiHeadAttention(BaseMultiHeadAttention):
@@ -441,6 +448,7 @@ class DecoderMHAFlashAttn(BaseMultiHeadAttention):
                 self.cross_cache_k = k
                 self.cross_cache_v = v
                 self.cross_cache_seqs = seq_lens
+                
       
             seq_lens = self.cross_cache_seqs[active_indices]
             total, _max_seq_k = seq_lens.sum().item(), seq_lens.max().item()
@@ -461,6 +469,9 @@ class DecoderMHAFlashAttn(BaseMultiHeadAttention):
             output = output.contiguous().view(bs, -1, self.d_model)
         output = self.fc(output)
         return output
+    
+    def parse_mask(self, mask):
+        return mask
 
 
 # @torch.compile(mode="reduce-overhead", backend="inductor")
