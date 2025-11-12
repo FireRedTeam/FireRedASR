@@ -190,10 +190,10 @@ class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_head, dropout):
         super().__init__()
         self.self_attn_norm = nn.LayerNorm(d_model)
-        self.self_attn = DecoderMultiHeadAttention(d_model, n_head, dropout)
+        self.self_attn = DecoderMultiHeadAttention(d_model, n_head, dropout, attention_type="self_attention")
 
         self.cross_attn_norm = nn.LayerNorm(d_model)
-        self.cross_attn = DecoderMultiHeadAttention(d_model, n_head, dropout)
+        self.cross_attn = DecoderMultiHeadAttention(d_model, n_head, dropout, attention_type="cross_attention")
 
         self.mlp_norm = nn.LayerNorm(d_model)
         self.mlp = PositionwiseFeedForward(d_model, d_model*4, dropout)
@@ -338,7 +338,7 @@ class XFormersAttentionMetadata:
         else:
             print("Unknown attention type used, only support `self_attention`")
 
-    def set_cross_attn_bias(self, mask, bs, q_len, k_len):
+    def set_cross_attn_bias(self, mask, bs, q_len, k_len, n_head, dtype, device):
         if self.attention_type == "cross_attention":
             mask = mask.to(torch.bool)
 
@@ -347,22 +347,22 @@ class XFormersAttentionMetadata:
                 mask = mask.expand(bs, 1, q_len, k_len)
 
             # Expand mask for all heads
-            mask = mask.expand(bs, self.n_head, q_len, k_len) \
-                    .reshape(bs * self.n_head, q_len, k_len)
+            mask = mask.expand(bs, n_head, q_len, k_len) \
+                    .reshape(bs * n_head, q_len, k_len)
 
             # Alignment requirement for xformers: pad allocation to multiple of 8
             pad_k = ((k_len + 7) // 8) * 8
             pad_q = ((q_len + 7) // 8) * 8
 
-            bias_full = torch.zeros(bs * self.n_head, pad_q, pad_k,
-                                    dtype=q.dtype, device=q.device)
+            bias_full = torch.zeros(bs * n_head, pad_q, pad_k,
+                                    dtype=dtype, device=device)
 
             bias_full[:, :q_len, :k_len].masked_fill_(~mask, float("-inf"))
 
             # Slice down to actual shape but keep aligned backing storage
             self.attn_bias = bias_full[:, :q_len, :k_len]
-
-            print("Unknown attention type used, only support `self_attention` and `cross_attention`")
+        else:
+            print("Unknown attention type used, only support `cross_attention`")
 
     def get_attn_bias(self):
         return self.attn_bias
@@ -391,34 +391,34 @@ class DecoderXFormersAttention(nn.Module):
         k_len = k.size(2)  # seq_len_k
         dtype = q.dtype
 
-        q = q.reshape(bs * self.n_head, -1, self.d_k).to(torch.bfloat16)
-        k = k.reshape(bs * self.n_head, -1, self.d_k).to(torch.bfloat16)
-        v = v.reshape(bs * self.n_head, -1, self.d_k).to(torch.bfloat16)
+        q = q.reshape(bs * self.n_head, -1, self.d_k).to(torch.float16)
+        k = k.reshape(bs * self.n_head, -1, self.d_k).to(torch.float16)
+        v = v.reshape(bs * self.n_head, -1, self.d_k).to(torch.float16)
 
         output = None
         if bs == 1:
             output = xops.memory_efficient_attention(q, k, v)
         else:
             attn_bias = None
-            # --- AUTO-DETECT causal self-attention ---
-            # q and k are the same tensor object in memory when this is pure self-attn
+            # --- causal self-attention ---
+            # q and k has same length, pass attn_bias=None
             if self.attention_metadata.attention_type == "self_attention":
-                attn_bias = xops.LowerTriangularMask()
+                attn_bias = None
 
             # --- Cross-attention / padding mask ---
-            #elif mask is not None:
             elif self.attention_metadata.attention_type == "cross_attention" and mask is not None:
                 if self.attention_metadata.get_attn_bias() == None:
-                    self.attention_metadata.set_cross_attn_bias(mask, bs, q_len, k_len)
+                    self.attention_metadata.set_cross_attn_bias(mask, bs, q_len, k_len, self.n_head, q.dtype, q.device)
                 attn_bias = self.attention_metadata.get_attn_bias()
+            else:
+                print("Unknown attention type used, only support `self_attention` and `cross_attention`")
 
             # --- Run memory-efficient attention ---
             output = xops.memory_efficient_attention(q, k, v,
-                                                    attn_bias=attn_bias if attn_bias is not None else None)
+                                                    attn_bias=attn_bias)
 
         # reshape back to (bs, seq_len, d_model)
         return output.view_as(original_query).to(dtype)
-
 
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
