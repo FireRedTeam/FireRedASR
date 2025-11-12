@@ -3,7 +3,7 @@ import time
 import torch
 import numpy as np
 from tqdm import tqdm
-
+import json
 import librosa
 import soundfile as sf
 import argparse
@@ -12,7 +12,7 @@ import torch
 from fireredasr.models.fireredasr import FireRedAsr
 
 from torch.profiler import profile as torch_profiler
-from torch.profiler import ProfilerActivity, record_function
+from torch.profiler import ProfilerActivity
 
 
 ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "XFORMERS") # Option: "NATIVE", "SDPA", "XFORMERS"
@@ -21,7 +21,7 @@ ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "XFORMERS") # Option: "N
 def load_model(model_path="pretrained_models/FireRedASR-AED-L"):
     print("==========Load model:========")
     model = FireRedAsr.from_pretrained("aed", model_path)
-    model.model.to(torch.bfloat16)
+    model.model.to(torch.float16)
     model.model.cuda()
     model.model.eval()
 
@@ -42,7 +42,7 @@ def run(model, batch_wav_path, warmpup=2, trials=10, enable_profile=False, offse
 
     preprocess_start = time.time()
     feats, lengths, durs = model.feat_extractor(batch_wav_path)
-    feats = feats.to(torch.bfloat16)
+    feats = feats.to(torch.float16)
     feats, lengths = feats.cuda(), lengths.cuda()
     preprocess_dur = time.time() - preprocess_start
     print(f"preprocess duration: {preprocess_dur:.3f} s")
@@ -53,7 +53,7 @@ def run(model, batch_wav_path, warmpup=2, trials=10, enable_profile=False, offse
     print("==========warmup========")
     for _ in range(warmpup):
         with torch.no_grad():
-            _ = model.model.transcribe(feats, lengths)
+            _ = model.model.transcribe(feats, lengths, beam_size=3, nbest=1, decode_max_len=0, softmax_smoothing=1.25, length_penalty=0.6, eos_penalty=1.0) # repetition_penalty=1.0, decode_min_len=0,  temperature=1.0 used only for llm
 
     # Benchmark
     print("==========start benchmark========")
@@ -73,11 +73,11 @@ def run(model, batch_wav_path, warmpup=2, trials=10, enable_profile=False, offse
                         record_shapes=True,
                         with_stack=True,
                         profile_memory=False) as prof:
-                    hyps = model.model.transcribe(feats, lengths)
+                    hyps = model.model.transcribe(feats, lengths, beam_size=3, nbest=1, decode_max_len=0, softmax_smoothing=1.25, length_penalty=0.6, eos_penalty=1.0) # repetition_penalty=1.0, decode_min_len=0,  temperature=1.0 used only for llm
                 print(prof.key_averages().table(sort_by="cuda_time_total"))
                 prof.export_chrome_trace(f"firered_asr_profile_{batch}_{ATTENTION_BACKEND}.json")
             else:
-                hyps = model.model.transcribe(feats, lengths)
+                hyps = model.model.transcribe(feats, lengths, beam_size=3, nbest=1, decode_max_len=0, softmax_smoothing=1.25, length_penalty=0.6, eos_penalty=1.0) # repetition_penalty=1.0, decode_min_len=0,  temperature=1.0 used only for llm
         total_time += time.time() - start
         elapsed = time.time() - start
 
@@ -92,8 +92,7 @@ def run(model, batch_wav_path, warmpup=2, trials=10, enable_profile=False, offse
 
     avg_latency = total_time / trials
     rps = batch / avg_latency
-    #Only print last result for debug purpose
-    #print("results[0]: ", results[0])
+    # Only print last result for debug purpose
     print("Only print last run results for debug purpose...")
     for res in results[-batch:]:
         print(res)
@@ -131,7 +130,6 @@ def benchmark(model, audio_dir, batch, warmpup=2, trials=10, enable_profile=Fals
     benchmark_results = []
     e2e_start = time.time()
     for start in range(0, dataset_size - dataset_size % batch, batch):
-        #batch_wav_path, dur = file_durations[start:start+batch]
         batch_wav_path = [path for path, _ in file_durations[start:start + batch]]
         print(f"Processing {batch} batched data from index {start} to {start + batch-1}")
         rps, avg_latency, avg_rtf, avg_audio_dur_per_sample, model_results = run(model, batch_wav_path, warmpup, trials, enable_profile, offset=start)
@@ -140,11 +138,11 @@ def benchmark(model, audio_dir, batch, warmpup=2, trials=10, enable_profile=Fals
     # Process remaining data if any
     remainder = dataset_size % batch
     if remainder:
-        #last_batch_wav_path = file_durations[-remainder:]
+        start+=batch
         last_batch_wav_path = [path for path, _ in file_durations[-remainder:]]
         print(f"Processing {remainder} remaining data : {last_batch_wav_path}")
         rps, avg_latency, avg_rtf, avg_audio_dur_per_sample, model_results = run(model, last_batch_wav_path, warmpup, trials, enable_profile, offset=start)
-        benchmark_results.append((batch, avg_audio_dur_per_sample, avg_latency, rps, avg_rtf, model_results))
+        benchmark_results.append((remainder, avg_audio_dur_per_sample, avg_latency, rps, avg_rtf, model_results))
     e2e_duration = time.time() - e2e_start
 
     return benchmark_results, e2e_duration
@@ -165,17 +163,25 @@ if __name__ == "__main__":
     model = load_model(model_path)
     
     if enable_profile:
-        #rps, avg_rtf, avg_latency = benchmark(model, audio_dir, batch=1, enable_profile=True)
         benchmark_results, e2e_duration = benchmark(model, audio_dir, batch=1, enable_profile=enable_profile)
     else:            
         for batch in batch_sizes:
             print(f"*************************** batch size {batch} ***************************")
-            #rps, avg_latency, avg_rtf = benchmark(model, audio_dir, batch=batch)
             benchmark_results, e2e_duration = benchmark(model, audio_dir, batch=batch, enable_profile=enable_profile)
 
-            #print(f"batch size: {batch}, average latency: {avg_latency:.3f}s | RPS: {rps:.2f}, avg RTF: {avg_rtf:.3f}")
             print(f"\nbatch size: {batch}, e2e latency: {e2e_duration} s")
+            save_results = []
+            save_path = f"ATTENTION_BACKEND_{ATTENTION_BACKEND}_bs_{batch}_output.json"
             for res in benchmark_results:
                 print(res[5])
+                save_results+=res[5]
             for res in benchmark_results:
                 print(f"batch size: {res[0]}, avg audio duration per sample: {res[1]:.3f} s, avg inference latency {res[2]:.3f} s | RPS: {res[3]:.2f}, avg RTF: {res[4]:.3f}")
+            with open(save_path, "w", encoding="utf-8") as final:
+                json.dump(save_results,
+                          final,
+                          indent=2,
+                          ensure_ascii=False,  # Keep non-ASCII characters intact
+                          default=lambda x: list(x) if isinstance(x, tuple) else str(x)
+                          )
+            print(f"Performance results written to {save_path}")
