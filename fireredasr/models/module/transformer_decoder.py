@@ -130,31 +130,30 @@ class TransformerDecoder(nn.Module):
 
         # Autoregressive Prediction
         for t in range(maxlen):
-            if ATTENTION_BACKEND == "FLASH_ATTN":
-                tgt_mask = raw_ys
-            else:
-                tgt_mask = self.ignored_target_position_is_0(ys, self.pad_id)
-                
-            dec_output = self.tgt_word_emb(ys) * self.scale + self.positional_encoding(ys)
             
             def expand(f, mask, indices, value=0.0, t=None):
                 if t is None:
                     t = torch.full((len(mask), *list(f.shape[1:])), value, dtype=f.dtype, device=f.device)
                 t[indices] = f
                 return t
-
+            
+            dec_output = self.tgt_word_emb(ys) * self.scale + self.positional_encoding(ys)
             dec_output = dec_output[active_indices]
             t_encoder_outputs = encoder_outputs[active_indices]
-            tgt_mask = tgt_mask[active_indices]
             t_src_mask = src_mask[active_indices]
             
-            seq_lens = self.cal_seq_lens(t_src_mask)
-            seq_lens_cpu = seq_lens.cpu()
-            total_seqlen_k, max_seqlen_k = seq_lens_cpu.sum().item(), seq_lens_cpu.max().item()
-            attn_meta.update(seq_lens=seq_lens, 
-                             max_seqlen_k=max_seqlen_k, 
-                             total_seqlen_k=total_seqlen_k,
+            if ATTENTION_BACKEND == "FLASH_ATTN":
+                tgt_mask = raw_ys[active_indices]
+                seq_lens = self.cal_seq_lens(t_src_mask)
+                seq_lens_cpu = seq_lens.cpu()
+                total_seqlen_k, max_seqlen_k = seq_lens_cpu.sum().item(), seq_lens_cpu.max().item()
+                attn_meta.update(seq_lens=seq_lens, 
+                                max_seqlen_k=max_seqlen_k, 
+                                total_seqlen_k=total_seqlen_k,
                              active_indices=active_indices)
+            else:
+                tgt_mask = self.ignored_target_position_is_0(ys, self.pad_id)
+                tgt_mask = tgt_mask[active_indices]
             
             for i, dec_layer in enumerate(self.layer_stack):        
                 dec_output = dec_layer.forward(
