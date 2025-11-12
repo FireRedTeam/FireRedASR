@@ -20,6 +20,31 @@ MultiHeadAttention = None
 print("ATTENTION_BACKEND: ", ATTENTION_BACKEND)
 
 
+class AttentionMeta(object):
+    
+    def __init__(self):
+        self.seq_lens = None
+        self.cu_seqlens_q = None
+        self.cu_seqlens_k = None
+        self.max_seqlen_q = None
+        self.max_seqlen_k = None
+        self.total_seqlen_k = None
+        self.active_indices = None
+
+    def update(self, seq_lens=None, 
+               cu_seqlens_q=None, cu_seqlens_k=None, 
+               max_seqlen_q=None, max_seqlen_k=None, 
+               total_seqlen_k=None,
+               active_indices=None):
+        self.seq_lens = seq_lens
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_k = cu_seqlens_k
+        self.max_seqlen_q = max_seqlen_q
+        self.max_seqlen_k = max_seqlen_k
+        self.total_seqlen_k = total_seqlen_k
+        self.active_indices = active_indices
+        
+
 class TransformerDecoder(nn.Module):
     def __init__(
             self, sos_id, eos_id, pad_id, odim,
@@ -47,6 +72,7 @@ class TransformerDecoder(nn.Module):
 
         self.tgt_word_prj.weight = self.tgt_word_emb.weight
         self.scale = (d_model ** 0.5)
+        
         self.scores_map = {}
         self.stride_map = {}
         self.filter_indexes = {}
@@ -55,7 +81,12 @@ class TransformerDecoder(nn.Module):
         
     def clear(self):
         for dec_layer in self.layer_stack:
-            dec_layer.clear()        
+            dec_layer.clear()     
+            
+            
+    def cal_seq_lens(self, mask):
+        mask = mask.squeeze(1)     
+        return mask.sum(dim=1, dtype=torch.int32)
         
 
     def batch_beam_search(self, encoder_outputs, src_masks,
@@ -71,7 +102,7 @@ class TransformerDecoder(nn.Module):
         # Init
         encoder_outputs = encoder_outputs.unsqueeze(1).repeat(1, B, 1, 1).view(M, Ti, H)
         src_mask = src_masks.unsqueeze(1).repeat(1, B, 1, 1).view(M, -1, Ti)
-        ys = torch.ones(M, 1, device=device).fill_(self.sos_id).long()
+        raw_ys = ys = torch.ones(M, 1, device=device).fill_(self.sos_id).long()
         caches: List[Optional[Tensor]] = []
         for _ in range(self.n_layers):
             caches.append(torch.empty(M, 0, H, device=device, dtype=encoder_outputs.dtype))
@@ -94,11 +125,13 @@ class TransformerDecoder(nn.Module):
         active_mask = self.active_masks[M]
         active_indices = self.filter_indexes[M]
         last_t_logit = None
+        
+        attn_meta = AttentionMeta()
 
         # Autoregressive Prediction
         for t in range(maxlen):
             if ATTENTION_BACKEND == "FLASH_ATTN":
-                tgt_mask = ys
+                tgt_mask = raw_ys
             else:
                 tgt_mask = self.ignored_target_position_is_0(ys, self.pad_id)
                 
@@ -115,14 +148,22 @@ class TransformerDecoder(nn.Module):
             tgt_mask = tgt_mask[active_indices]
             t_src_mask = src_mask[active_indices]
             
-            for i, dec_layer in enumerate(self.layer_stack):
+            seq_lens = self.cal_seq_lens(t_src_mask)
+            seq_lens_cpu = seq_lens.cpu()
+            total_seqlen_k, max_seqlen_k = seq_lens_cpu.sum().item(), seq_lens_cpu.max().item()
+            attn_meta.update(seq_lens=seq_lens, 
+                             max_seqlen_k=max_seqlen_k, 
+                             total_seqlen_k=total_seqlen_k,
+                             active_indices=active_indices)
+            
+            for i, dec_layer in enumerate(self.layer_stack):        
                 dec_output = dec_layer.forward(
                     dec_output, 
                     t_encoder_outputs,
                     tgt_mask, 
                     t_src_mask,
                     cache=caches[i][active_indices],
-                    active_indices=active_indices)
+                    attn_meta=attn_meta)
                 caches[i] = dec_output          
 
             dec_output = self.layer_norm_out(dec_output)
@@ -227,7 +268,6 @@ class TransformerDecoder(nn.Module):
         return ys_lengths.int()
 
 
-
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_head, dropout):
         super().__init__()
@@ -255,7 +295,7 @@ class DecoderLayer(nn.Module):
         self.cross_attn.clear()
 
     def forward(self, dec_input, enc_output, self_attn_mask, cross_attn_mask,
-                cache=None, active_indices=None):
+                cache=None, attn_meta:AttentionMeta=None):
         x = dec_input
         residual = x
         x = self.self_attn_norm(x)
@@ -272,7 +312,7 @@ class DecoderLayer(nn.Module):
                                      enc_output, 
                                      mask=cross_attn_mask, 
                                      is_cross=True,
-                                     active_indices=active_indices)
+                                     attn_meta=attn_meta)
 
         residual = x
         x = self.mlp_norm(x)
@@ -293,7 +333,7 @@ class BaseMultiHeadAttention(nn.Module):
         self.w_vs = nn.Linear(d_model, n_head * self.d_k)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
 
-    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
+    def forward(self, q, k, v, mask=None, is_cross=False, attn_meta:AttentionMeta=None):
         raise NotImplementedError
     
     def clear(self):
@@ -308,7 +348,7 @@ class DecoderMultiHeadAttention(BaseMultiHeadAttention):
         super().__init__(d_model, n_head, dropout)
         self.attention = DecoderScaledDotProductAttention(temperature=self.d_k ** 0.5)
 
-    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
+    def forward(self, q, k, v, mask=None, is_cross=False, attn_meta:AttentionMeta=None):
         bs = q.size(0)
 
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k)
@@ -351,7 +391,7 @@ class DecoderMHATorchSDPA(BaseMultiHeadAttention):
         super().__init__(d_model, n_head, dropout)
         self.attention = DecoderTorchSDPA(temperature=self.d_k ** 0.5)
 
-    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
+    def forward(self, q, k, v, mask=None, is_cross=False, attn_meta:AttentionMeta=None):
         bs = q.size(0)
 
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
@@ -393,7 +433,7 @@ class DecoderMHAXFormers(BaseMultiHeadAttention):
     def __init__(self, d_model, n_head, dropout=0.1):
         super().__init__(d_model, n_head, dropout)
 
-    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
+    def forward(self, q, k, v, mask=None, is_cross=False, attn_meta:AttentionMeta=None):
         bs = q.size(0)
 
         # projection and transform to (batch*n_head, seq_len, head_dim)
@@ -418,14 +458,12 @@ class DecoderMHAFlashAttn(BaseMultiHeadAttention):
         
         self.cross_cache_k = None
         self.cross_cache_v = None
-        self.cross_cache_seqs = None
         
     def clear(self):
         self.cross_cache_k = None
         self.cross_cache_v = None
-        self.cross_cache_seqs = None
 
-    def forward(self, q, k, v, mask=None, is_cross=False, active_indices=None):
+    def forward(self, q, k, v, mask=None, is_cross=False, attn_meta:AttentionMeta=None):
         is_casual = not is_cross
         bs = q.size(0)
         
@@ -444,14 +482,12 @@ class DecoderMHAFlashAttn(BaseMultiHeadAttention):
                 k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
                 v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)  
                 
-                seq_lens = mask.sum(dim=1, dtype=torch.int32)
                 self.cross_cache_k = k
                 self.cross_cache_v = v
-                self.cross_cache_seqs = seq_lens
                 
-      
-            seq_lens = self.cross_cache_seqs[active_indices]
-            total, _max_seq_k = seq_lens.sum().item(), seq_lens.max().item()
+            active_indices = attn_meta.active_indices
+            seq_lens = attn_meta.seq_lens
+            total, _max_seq_k = attn_meta.total_seqlen_k, attn_meta.max_seqlen_k
             bool_indices = torch.nonzero_static(bool_mask, size=total).squeeze(1)
             var_k = self.cross_cache_k[active_indices].view(-1, self.n_head, self.d_k)[bool_indices]
             var_v = self.cross_cache_v[active_indices].view(-1, self.n_head, self.d_k)[bool_indices]
