@@ -15,7 +15,7 @@ from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 import einops
 
-ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "SDPA") # Option: "NATIVE", "SDPA", "XFORMERS"
+ATTENTION_BACKEND = os.environ.get("ATTENTION_BACKEND", "SDPA") # Option: "NATIVE", "SDPA", "XFORMERS", "FLASH_ATTN"
 MultiHeadAttention = None
 print("ATTENTION_BACKEND: ", ATTENTION_BACKEND)
 
@@ -142,7 +142,7 @@ class TransformerDecoder(nn.Module):
             t_encoder_outputs = encoder_outputs[active_indices]
             t_src_mask = src_mask[active_indices]
             
-            if ATTENTION_BACKEND == "FLASH_ATTN":
+            if ATTENTION_BACKEND in {"FLASH_ATTN", "XFORMERS"}:
                 tgt_mask = raw_ys[active_indices]
                 seq_lens = self.cal_seq_lens(t_src_mask)
                 seq_lens_cpu = seq_lens.cpu()
@@ -276,7 +276,7 @@ class DecoderLayer(nn.Module):
         elif ATTENTION_BACKEND.upper() == "SDPA":
             MultiHeadAttention = DecoderMHATorchSDPA
         elif ATTENTION_BACKEND.upper() == "XFORMERS":
-            MultiHeadAttention = DecoderMHAXFormers
+            MultiHeadAttention = DecoderXFormersAttention
         elif ATTENTION_BACKEND.upper() == "FLASH_ATTN":
             MultiHeadAttention = DecoderMHAFlashAttn
         else:
@@ -414,11 +414,6 @@ class DecoderTorchSDPA(nn.Module):
                 True means 'mask out'.
               - If float: same shape, with -inf for masked positions.
         """
-        # F.scaled_dot_product_attention will:
-        # - scale internally
-        # - apply softmax
-        # - apply mask if given
-        # - compute attention output
         output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask.eq(1),
@@ -427,28 +422,98 @@ class DecoderTorchSDPA(nn.Module):
         )
         return output
 
-# MHA with xFormers
-class DecoderMHAXFormers(BaseMultiHeadAttention):
+
+# xFormers Attention
+class DecoderXFormersAttention(BaseMultiHeadAttention):
     def __init__(self, d_model, n_head, dropout=0.1):
         super().__init__(d_model, n_head, dropout)
+        self.attn_bias = None
+        
+    def set_cross_attn_bias(self, mask, bs, q_len, k_len, n_head, dtype, device, is_cross=False):
+        if is_cross:
+            mask = mask.to(torch.bool)
+
+            # If mask only has 1 in q_len dimension, expand it
+            if mask.size(2) == 1 and q_len > 1:
+                mask = mask.expand(bs, 1, q_len, k_len)
+
+            # Expand mask for all heads
+            mask = mask.expand(bs, n_head, q_len, k_len) \
+                    .reshape(bs * n_head, q_len, k_len)
+
+            # Alignment requirement for xformers: pad allocation to multiple of 8
+            pad_k = ((k_len + 7) // 8) * 8
+            pad_q = ((q_len + 7) // 8) * 8
+
+            bias_full = torch.zeros(bs * n_head, pad_q, pad_k,
+                                    dtype=dtype, device=device)
+
+            bias_full[:, :q_len, :k_len].masked_fill_(~mask, float("-inf"))
+
+            # Slice down to actual shape but keep aligned backing storage
+            self.attn_bias = bias_full[:, :q_len, :k_len]
+        else:
+            print("Unknown attention type used, only support `cross_attention`")
+            
+    def get_attn_bias(self):
+        return self.attn_bias
+
+    def reset_attn_bias(self):
+        self.attn_bias = None
 
     def forward(self, q, k, v, mask=None, is_cross=False, attn_meta:AttentionMeta=None):
         bs = q.size(0)
+            
+        q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+        v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k).transpose(1, 2)
+    
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+            
+        original_query = q
+            
+        # Save lengths
+        q_len = q.size(2)  # seq_len_q
+        k_len = k.size(2)  # seq_len_k
+        dtype = q.dtype
 
-        # projection and transform to (batch*n_head, seq_len, head_dim)
-        q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k).transpose(1, 2).reshape(bs * self.n_head, -1, self.d_k)
-        k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k).transpose(1, 2).reshape(bs * self.n_head, -1, self.d_k)
-        v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k).transpose(1, 2).reshape(bs * self.n_head, -1, self.d_k)
-        # single-step reshape+transpose
-        #q = einops.rearrange(self.w_qs(q), 'b s (h d) -> (b h) s d', h=self.n_head)
-        #k = einops.rearrange(self.w_ks(k), 'b s (h d) -> (b h) s d', h=self.n_head)
-        #v = einops.rearrange(self.w_vs(v), 'b s (h d) -> (b h) s d', h=self.n_head)
-        output = xops.memory_efficient_attention(q, k, v)
-        # back to (bs, seq_len, d_model)
-        output = output.reshape(bs, self.n_head, -1, self.d_k).transpose(1, 2).contiguous().view(bs, -1, self.d_model)
-        #output = einops.rearrange(output, '(b h) s d -> b s (h d)', b=bs, h=self.n_head)
+        q = q.reshape(bs * self.n_head, -1, self.d_k).to(torch.float16)
+        k = k.reshape(bs * self.n_head, -1, self.d_k).to(torch.float16)
+        v = v.reshape(bs * self.n_head, -1, self.d_k).to(torch.float16)
+
+        output = None
+        if bs == 1:
+            output = xops.memory_efficient_attention(q, k, v)
+        else:
+            attn_bias = None
+            # --- causal self-attention ---
+            # q and k has same length, pass attn_bias=None
+            if not is_cross:
+                attn_bias = None
+
+            # --- Cross-attention / padding mask ---
+            elif is_cross and mask is not None:
+                self.set_cross_attn_bias(mask, bs, q_len, k_len, self.n_head, q.dtype, q.device, is_cross=is_cross)
+                attn_bias = self.get_attn_bias()
+            else:
+                print("Unknown attention type used, only support `self_attention` and `cross_attention`")
+
+            # --- Run memory-efficient attention ---
+            
+            output = xops.memory_efficient_attention(q, k, v,
+                                                    attn_bias=attn_bias)
+        # reshape back to (bs, seq_len, d_model)
+        output = output.view_as(original_query).to(dtype) 
+        output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         output = self.fc(output)
         return output
+    
+    def clear(self):
+        self.reset_attn_bias()
+        
+    def parse_mask(self, mask):
+        return mask
     
     
 class DecoderMHAFlashAttn(BaseMultiHeadAttention):
