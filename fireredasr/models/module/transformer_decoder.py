@@ -142,7 +142,7 @@ class TransformerDecoder(nn.Module):
             t_encoder_outputs = encoder_outputs[active_indices]
             t_src_mask = src_mask[active_indices]
             
-            if ATTENTION_BACKEND in {"FLASH_ATTN", "XFORMERS"}:
+            if ATTENTION_BACKEND in {"FLASH_ATTN"}:
                 tgt_mask = raw_ys[active_indices]
                 seq_lens = self.cal_seq_lens(t_src_mask)
                 seq_lens_cpu = seq_lens.cpu()
