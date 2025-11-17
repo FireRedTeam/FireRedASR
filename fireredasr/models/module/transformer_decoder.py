@@ -51,8 +51,10 @@ class TransformerDecoder(nn.Module):
                    softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0):
         if ATTENTION_BACKEND.upper() == "XFORMERS":
             for dec_layer in self.layer_stack:
-                dec_layer.self_attn.attention.reset_attn_bias()
                 dec_layer.cross_attn.attention.reset_attn_bias()
+
+        for dec_layer in self.layer_stack:
+            dec_layer.cross_attn.clear_states()
         B = beam_size
         N, Ti, H = encoder_outputs.size()
         device = encoder_outputs.device
@@ -255,6 +257,11 @@ class DecoderMultiHeadAttention(nn.Module):
             exit(1)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.attention_type = attention_type
+        self.kv_proj = None
+
+    def clear_states(self):
+        self.kv_proj = None
 
     def forward(self, q, k, v, mask=None):
         bs = q.size(0)
@@ -262,6 +269,17 @@ class DecoderMultiHeadAttention(nn.Module):
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k)
         k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
         v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)
+        if self.attention_type=="cross_attention":
+            # cross attention reuse the same k,v projection throughout decoding phase
+            if self.kv_proj is None:
+                self.kv_proj = (
+                    self.w_ks(k).view(bs, -1, self.n_head, self.d_k),
+                    self.w_vs(v).view(bs, -1, self.n_head, self.d_k)
+                )
+            k,v = self.kv_proj
+        else:
+            k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
+            v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -331,12 +349,6 @@ class XFormersAttentionMetadata:
     def __init__(self, attention_type):
         self.attention_type = attention_type
         self.attn_bias = None
-
-    def set_self_attn_bias(self):
-        if self.attention_type == "self_attention":
-            self.attn_bias = xops.LowerTriangularMask()
-        else:
-            print("Unknown attention type used, only support `self_attention`")
 
     def set_cross_attn_bias(self, mask, bs, q_len, k_len, n_head, dtype, device):
         if self.attention_type == "cross_attention":
