@@ -1,11 +1,10 @@
+import os
 from typing import List, Optional, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-import math
-import os
 
 try:
     import xformers.ops as xops
@@ -192,10 +191,10 @@ class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_head, dropout):
         super().__init__()
         self.self_attn_norm = nn.LayerNorm(d_model)
-        self.self_attn = DecoderMultiHeadAttention(d_model, n_head, dropout, attention_type="self_attention")
+        self.self_attn = DecoderMultiHeadAttention(d_model, n_head, dropout, is_cross=False)
 
         self.cross_attn_norm = nn.LayerNorm(d_model)
-        self.cross_attn = DecoderMultiHeadAttention(d_model, n_head, dropout, attention_type="cross_attention")
+        self.cross_attn = DecoderMultiHeadAttention(d_model, n_head, dropout, is_cross=True)
 
         self.mlp_norm = nn.LayerNorm(d_model)
         self.mlp = PositionwiseFeedForward(d_model, d_model*4, dropout)
@@ -230,7 +229,7 @@ class DecoderLayer(nn.Module):
 
 
 class DecoderMultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_head, dropout=0.1, attention_type=None):
+    def __init__(self, d_model, n_head, dropout=0.1, is_cross = False):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
@@ -251,25 +250,23 @@ class DecoderMultiHeadAttention(nn.Module):
             if not xformers_available:
                 print("ATTENTION_BACKEND='XFORMERS' selected, but the xformers package is not available. Please install xformers")
                 exit(1)
-            self.attention = DecoderXFormersAttention(self.n_head, self.d_k, self.d_model, temperature=self.d_k ** 0.5, attention_type=attention_type)
+            self.attention = DecoderXFormersAttention(self.n_head, self.d_k, self.d_model, temperature=self.d_k ** 0.5, is_cross=is_cross)
         else:
             print("Unsupported attention backend: ", ATTENTION_BACKEND)
             exit(1)
         self.fc = nn.Linear(n_head * self.d_k, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.attention_type = attention_type
+        self.is_cross = is_cross
         self.kv_proj = None
 
     def clear_states(self):
         self.kv_proj = None
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, mask=None, cross_kv_cache=None):
         bs = q.size(0)
 
         q = self.w_qs(q).view(bs, -1, self.n_head, self.d_k)
-        k = self.w_ks(k).view(bs, -1, self.n_head, self.d_k)
-        v = self.w_vs(v).view(bs, -1, self.n_head, self.d_k)
-        if self.attention_type=="cross_attention":
+        if self.is_cross:
             # cross attention reuse the same k,v projection throughout decoding phase
             if self.kv_proj is None:
                 self.kv_proj = (
@@ -343,15 +340,14 @@ class DecoderTorchSDPA(nn.Module):
 
         return output
 
-
 class XFormersAttentionMetadata:
     """Metadata for XFormers Attention backend """
-    def __init__(self, attention_type):
-        self.attention_type = attention_type
+    def __init__(self, is_cross):
+        self.is_cross = is_cross
         self.attn_bias = None
 
     def set_cross_attn_bias(self, mask, bs, q_len, k_len, n_head, dtype, device):
-        if self.attention_type == "cross_attention":
+        if self.is_cross:
             mask = mask.to(torch.bool)
 
             # If mask only has 1 in q_len dimension, expand it
@@ -373,8 +369,6 @@ class XFormersAttentionMetadata:
 
             # Slice down to actual shape but keep aligned backing storage
             self.attn_bias = bias_full[:, :q_len, :k_len]
-        else:
-            print("Unknown attention type used, only support `cross_attention`")
 
     def get_attn_bias(self):
         return self.attn_bias
@@ -384,13 +378,14 @@ class XFormersAttentionMetadata:
 
 # xFormers Attention
 class DecoderXFormersAttention(nn.Module):
-    def __init__(self, n_head, d_k, d_model, temperature, attention_type):
+    def __init__(self, n_head, d_k, d_model, temperature, is_cross):
         super().__init__()
         self.temperature = temperature
         self.n_head = n_head
         self.d_k = d_k
         self.d_model = d_model
-        self.attention_metadata = XFormersAttentionMetadata(attention_type)
+        self.attention_metadata = XFormersAttentionMetadata(is_cross)
+        self.is_cross = is_cross
 
     def reset_attn_bias(self):
         self.attention_metadata.reset_attn_bias()
@@ -412,25 +407,18 @@ class DecoderXFormersAttention(nn.Module):
             output = xops.memory_efficient_attention(q, k, v)
         else:
             attn_bias = None
-            # --- causal self-attention ---
-            # q and k has same length, pass attn_bias=None
-            if self.attention_metadata.attention_type == "self_attention":
-                attn_bias = None
-
             # --- Cross-attention / padding mask ---
-            elif self.attention_metadata.attention_type == "cross_attention" and mask is not None:
+            if self.is_cross and mask is not None:
                 if self.attention_metadata.get_attn_bias() == None:
                     self.attention_metadata.set_cross_attn_bias(mask, bs, q_len, k_len, self.n_head, q.dtype, q.device)
                 attn_bias = self.attention_metadata.get_attn_bias()
-            else:
-                print("Unknown attention type used, only support `self_attention` and `cross_attention`")
 
             # --- Run memory-efficient attention ---
             output = xops.memory_efficient_attention(q, k, v,
                                                     attn_bias=attn_bias)
 
         # reshape back to (bs, seq_len, d_model)
-        return output.view_as(original_query).to(dtype)
+        return output.to(dtype)
 
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
