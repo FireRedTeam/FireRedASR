@@ -27,7 +27,9 @@ class ConformerEncoder(nn.Module):
                 (0, 0, 0, self.input_preprocessor.context - 1), 'constant', 0.0)
         src_mask = self.padding_position_is_0(padded_input, input_lengths)
 
-        embed_output, input_lengths, src_mask = self.input_preprocessor(padded_input, src_mask)
+        embed_output, input_lengths, src_mask = self.input_preprocessor(
+            padded_input, src_mask, input_lengths
+        )
         enc_output = self.dropout(embed_output)
 
         pos_emb = self.dropout(self.positional_encoding(embed_output))
@@ -46,7 +48,7 @@ class ConformerEncoder(nn.Module):
         for i in range(N):
             mask[i, input_lengths[i]:] = 0
         mask = mask.unsqueeze(dim=1)
-        return mask.to(torch.uint8)
+        return mask.to(torch.bool)
 
 
 class RelPosEmbConformerBlock(nn.Module):
@@ -79,12 +81,12 @@ class Swish(nn.Module):
 class Conv2dSubsampling(nn.Module):
     def __init__(self, idim, d_model, out_channels=32):
         super().__init__()
-        self.conv = nn.Sequential(
+        self.conv = nn.ModuleList([
             nn.Conv2d(1, out_channels, 3, 2),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, 3, 2),
             nn.ReLU(),
-        )
+        ])
         subsample_idim = ((idim - 1) // 2 - 1) // 2
         self.out = nn.Linear(out_channels * subsample_idim, d_model)
 
@@ -92,14 +94,27 @@ class Conv2dSubsampling(nn.Module):
         left_context = right_context = 3  # both exclude currect frame
         self.context = left_context + 1 + right_context  # 7
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, input_lengths):
         x = x.unsqueeze(1)
-        x = self.conv(x)
+        for layer in self.conv:
+            x = layer(x)
         N, C, T, D = x.size()
         x = self.out(x.transpose(1, 2).contiguous().view(N, T, C * D))
-        mask = x_mask[:, :, :-2:2][:, :, :-2:2]
-        input_lengths = mask[:, -1, :].sum(dim=-1)
-        return x, input_lengths, mask
+
+        # Arithmetically calculate the output lengths, which is more robust for TRT.
+        # The conv layers in Conv2dSubsampling have kernel_size=3, stride=2
+        # which corresponds to a length calculation of (L-3)//2 + 1
+        output_lengths = (input_lengths - 3) // 2 + 1
+        output_lengths = (output_lengths - 3) // 2 + 1
+
+        # Re-create the mask from the correctly calculated lengths.
+        max_len = x.size(1)
+        device = x.device
+        indices = torch.arange(max_len, device=device).expand(N, -1)
+        mask = indices < output_lengths.unsqueeze(1)
+        mask = mask.unsqueeze(1)  # (N, 1, T_out)
+
+        return x, output_lengths, mask
 
 
 class RelPositionalEncoding(torch.nn.Module):
