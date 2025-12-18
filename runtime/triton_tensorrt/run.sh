@@ -36,6 +36,11 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
     subset_name=test
     split_name=test
 
+
+    # dataset_name="yuekai/speechio"
+    # subset_name="SPEECHIO_ASR_ZH00007"
+    # split_name="test"
+
     python3 Triton-ASR-Client/client.py \
         --server-addr localhost \
         --model-name fireredasr \
