@@ -10,5 +10,5 @@ RUN git clone https://github.com/csukuangfj/kaldifeat && \
     sed -i 's/in running_cuda_version//g' get_version.py && \
     python3 setup.py install && \
     cd -
-RUN pip install kaldiio kaldialign tritonclient[grpc]==2.31 soundfile numpy scipy
+RUN pip install kaldiio kaldialign tritonclient[grpc]==2.31 soundfile numpy scipy librosa
 WORKDIR /workspace
