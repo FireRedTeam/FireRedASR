@@ -99,7 +99,12 @@ def get_wav_info(args):
     return wavs
 
 
-if __name__ == "__main__":
+def cli():
+    """Console script entry point."""
     args = parser.parse_args()
     print(args)
     main(args)
+
+
+if __name__ == "__main__":
+    cli()

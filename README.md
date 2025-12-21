@@ -57,23 +57,35 @@ Download model files from [huggingface](https://huggingface.co/fireredteam) and 
 If you want to use `FireRedASR-LLM-L`, you also need to download [Qwen2-7B-Instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) and place it in the folder `pretrained_models`. Then, go to folder `FireRedASR-LLM-L` and run `$ ln -s ../Qwen2-7B-Instruct`
 
 
-### Setup
-Create a Python environment and install dependencies
+### Installation
+
+#### Option 1: Install from GitHub (Recommended)
 ```bash
-$ git clone https://github.com/FireRedTeam/FireRedASR.git
-$ conda create --name fireredasr python=3.10
-$ pip install -r requirements.txt
+$ pip install git+https://github.com/FireRedTeam/FireRedASR.git
 ```
 
-Set up Linux PATH and PYTHONPATH
+#### Option 2: Install from Source
+```bash
+$ git clone https://github.com/FireRedTeam/FireRedASR.git
+$ cd FireRedASR
+$ pip install -e .
 ```
+
+#### Option 3: Manual Setup (Legacy)
+```bash
+$ git clone https://github.com/FireRedTeam/FireRedASR.git
+$ cd FireRedASR
+$ conda create --name fireredasr python=3.10
+$ conda activate fireredasr
+$ pip install -r requirements.txt
 $ export PATH=$PWD/fireredasr/:$PWD/fireredasr/utils/:$PATH
 $ export PYTHONPATH=$PWD/:$PYTHONPATH
 ```
 
-Convert audio to 16kHz 16-bit PCM format
-```
-ffmpeg -i input_audio -ar 16000 -ac 1 -acodec pcm_s16le -f wav output.wav
+### Audio Preprocessing
+Convert audio to 16kHz 16-bit PCM format:
+```bash
+$ ffmpeg -i input_audio -ar 16000 -ac 1 -acodec pcm_s16le -f wav output.wav
 ```
 
 ### Quick Start

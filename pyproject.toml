@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fireredasr"
+version = "0.1.0"
+description = "Open-Source Industrial-Grade Automatic Speech Recognition Models"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "FireRedTeam"}
+]
+keywords = ["asr", "speech recognition", "automatic speech recognition", "mandarin", "chinese"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "cn2an>=0.5.23",
+    "kaldiio>=2.18.0",
+    "kaldi_native_fbank>=1.15",
+    "numpy>=1.26.1",
+    "peft>=0.13.2",
+    "sentencepiece",
+    "torch>=2.0.0",
+    "transformers>=4.46.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/FireRedTeam/FireRedASR"
+Documentation = "https://github.com/FireRedTeam/FireRedASR"
+Repository = "https://github.com/FireRedTeam/FireRedASR"
+Paper = "https://arxiv.org/pdf/2501.14350"
+
+[project.scripts]
+speech2text = "fireredasr.speech2text:cli"
+
+[tool.setuptools]
+packages = ["fireredasr", "fireredasr.data", "fireredasr.models", "fireredasr.models.module", "fireredasr.tokenizer", "fireredasr.utils"]
