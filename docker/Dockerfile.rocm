@@ -1,0 +1,28 @@
+ARG BASE_IMAGE=rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+FROM ${BASE_IMAGE} AS base
+
+ARG PYTORCH_ROCM_ARCH=gfx942
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+ENV HIP_ARCHITECTURE=${PYTORCH_ROCM_ARCH}
+ENV ROCM_PATH=/opt/rocm
+ENV XFORMERS_CK_FLASH_ATTN=1
+ARG PYTHON_VERSION=3.12
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /root
+
+RUN set -ex && usermod -a -G video $(whoami)
+
+RUN python3 -m pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
+
+RUN git clone https://github.com/FireRedTeam/FireRedASR /root/FireRedASR \ 
+    && cd /root/FireRedASR \
+    && python3 -m pip install -r requirements.txt
+
+RUN git clone https://github.com/ROCm/xformers.git /root/xformers \
+    && cd /root/xformers \
+    && git checkout 5f0419a \
+    && git submodule update --init --recursive \
+    && PYTORCH_ROCM_ARCH=$PYTORCH_ROCM_ARCH HIP_ARCHITECTURE=$HIP_ARCHITECTURE XFORMERS_CK_FLASH_ATTN=$XFORMERS_CK_FLASH_ATTN python3 setup.py install
+
+WORKDIR /root/FireRedASR
