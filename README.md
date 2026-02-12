@@ -10,10 +10,15 @@ Automatic Speech Recognition Models</h1>
 [[Blog]](https://fireredteam.github.io/demos/firered_asr/)
 [[Demo]](https://huggingface.co/spaces/FireRedTeam/FireRedASR)
 
+**FireRedASR2S has been open-sourced! Welcome to try it! https://github.com/FireRedTeam/FireRedASR2S**
+
+**FireRedASR2S is a state-of-the-art (SOTA), industrial-grade, all-in-one ASR system with ASR, VAD, LID, and Punc modules. All modules achieve SOTA performance**
+
 FireRedASR is a family of open-source industrial-grade automatic speech recognition (ASR) models supporting Mandarin, Chinese dialects and English, achieving a new state-of-the-art (SOTA) on public Mandarin ASR benchmarks, while also offering outstanding singing lyrics recognition capability.
 
 
 ## 🔥 News
+- [2026.02.12] We release [FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S) (FireRedASR2-AED, FireRedVAD, FireRedLID, and FireRedPunc) with model weights and inference code. See https://github.com/FireRedTeam/FireRedASR2S
 - [2025/02/17] We release [FireRedASR-LLM-L](https://huggingface.co/fireredteam/FireRedASR-LLM-L/tree/main) model weights.
 - [2025/01/24] We release [technical report](https://arxiv.org/pdf/2501.14350), [blog](https://fireredteam.github.io/demos/firered_asr/), and [FireRedASR-AED-L](https://huggingface.co/fireredteam/FireRedASR-AED-L/tree/main) model weights.
 
