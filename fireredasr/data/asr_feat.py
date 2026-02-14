@@ -82,6 +82,8 @@ class KaldifeatFbank:
         opts.frame_opts.dither = dither
         opts.mel_opts.num_bins = num_mel_bins
         opts.frame_opts.snip_edges = True
+        opts.frame_opts.frame_length_ms = frame_length
+        opts.frame_opts.frame_shift_ms = frame_shift
         opts.mel_opts.debug_mel = False
         self.opts = opts
 
@@ -94,6 +96,7 @@ class KaldifeatFbank:
 
         dither = self.dither if is_train else 0.0
         self.opts.frame_opts.dither = dither
+        self.opts.frame_opts.samp_freq = sample_rate
         fbank = knf.OnlineFbank(self.opts)
 
         fbank.accept_waveform(sample_rate, wav_np.tolist())
