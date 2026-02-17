@@ -147,6 +147,31 @@ print(results)
 - FireRedASR-AED supports audio input up to 60s. Input longer than 60s may cause hallucination issues, and input exceeding 200s will trigger positional encoding errors.
 - FireRedASR-LLM supports audio input up to 30s. The behavior for longer input is currently unknown.
 
+### FireRedASR-AED Optimization with ROCm
+1. Build docker image with `docker/Dockerfile.rocm` to setup environemt
+```
+docker build --network=host -f docker/Dockerfile.rocm -t rocm/firered-asr-opt
+```
+
+2. Launch docker container
+```
+docker run -it  --ipc=host --network=host --privileged --security-opt seccomp=unconfined --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE --device=/dev/kfd --device=/dev/dri --device=/dev/mem rocm/firered-asr-opt
+```
+
+3. Run performance test with native MHA (baseline)
+```python
+ATTENTION_BACKEND="NATIVE" python examples/benchmark_firered_asr.py
+```
+
+4. Run performance test with MHA using torch SDPA
+```python
+ATTENTION_BACKEND="SDPA" python examples/benchmark_firered_asr.py
+```
+
+5. Run performance test with MHA using xFormers
+```python
+ATTENTION_BACKEND="XFORMERS" python examples/benchmark_firered_asr.py
+```
 
 ## Acknowledgements
 Thanks to the following open-source works:
