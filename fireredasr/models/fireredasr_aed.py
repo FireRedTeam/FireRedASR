@@ -4,6 +4,7 @@ from fireredasr.models.module.conformer_encoder import ConformerEncoder
 from fireredasr.models.module.transformer_decoder import TransformerDecoder
 
 
+@torch.compile(mode="max-autotune")
 class FireRedAsrAed(torch.nn.Module):
     @classmethod
     def from_args(cls, args):
@@ -28,6 +29,7 @@ class FireRedAsrAed(torch.nn.Module):
                    beam_size=1, nbest=1, decode_max_len=0,
                    softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0):
         enc_outputs, _, enc_mask = self.encoder(padded_input, input_lengths)
+        self.decoder.clear()
         nbest_hyps = self.decoder.batch_beam_search(
             enc_outputs, enc_mask,
             beam_size, nbest, decode_max_len,
