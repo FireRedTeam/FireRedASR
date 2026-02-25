@@ -18,6 +18,7 @@ FireRedASR is a family of open-source industrial-grade automatic speech recognit
 
 
 ## 🔥 News
+- [2026.02.25] We release **[FireRedASR2-LLM](https://github.com/FireRedTeam/FireRedASR2S) model weights**. [🤗](https://huggingface.co/FireRedTeam/FireRedASR2-LLM) [🤖](https://www.modelscope.cn/models/xukaituo/FireRedASR2-LLM/)
 - [2026.02.12] We release [FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S) (FireRedASR2-AED, FireRedVAD, FireRedLID, and FireRedPunc) with model weights and inference code. See https://github.com/FireRedTeam/FireRedASR2S
 - [2025.02.17] We release [FireRedASR-LLM-L](https://huggingface.co/fireredteam/FireRedASR-LLM-L/tree/main) model weights.
 - [2025.01.24] We release [technical report](https://arxiv.org/pdf/2501.14350), [blog](https://fireredteam.github.io/demos/firered_asr/), and [FireRedASR-AED-L](https://huggingface.co/fireredteam/FireRedASR-AED-L/tree/main) model weights.
